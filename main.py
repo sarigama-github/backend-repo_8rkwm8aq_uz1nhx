@@ -1,10 +1,11 @@
 import os
 import secrets
 import string
+import base64
 from datetime import datetime, timezone, timedelta
-from typing import Optional
+from typing import Optional, Dict, Any
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -68,16 +69,26 @@ def test_database():
 
 
 # ----------------------
-# QR Login Implementation
+# Helpers
 # ----------------------
-
 SESSION_TTL_MINUTES = 10
-
+WEBAUTHN_TTL_MINUTES = 10
 
 def _random_token(n: int = 32) -> str:
     alphabet = string.ascii_letters + string.digits
     return ''.join(secrets.choice(alphabet) for _ in range(n))
 
+def _b64url(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).rstrip(b'=').decode('ascii')
+
+def _from_b64url(data: str) -> bytes:
+    padding = '=' * (-len(data) % 4)
+    return base64.urlsafe_b64decode(data + padding)
+
+
+# ----------------------
+# QR Login Implementation
+# ----------------------
 
 class StartQRResponse(BaseModel):
     token: str
@@ -188,6 +199,159 @@ def qr_consume(token: str):
     now = datetime.now(timezone.utc)
     db["authsession"].update_one({"_id": doc["_id"]}, {"$set": {"status": "consumed", "updated_at": now}})
     return {"ok": True}
+
+
+# ----------------------
+# Minimal WebAuthn Demo Endpoints (non-cryptographic demo)
+# ----------------------
+
+class StartRegRequest(BaseModel):
+    email: str
+    name: Optional[str] = None
+
+class StartRegResponse(BaseModel):
+    challenge: str
+    rpId: str
+    userId: str
+
+class FinishRegRequest(BaseModel):
+    email: str
+    name: Optional[str] = None
+    id: str
+    rawId: str
+    response: Dict[str, Any]
+    type: str
+
+class StartLoginRequest(BaseModel):
+    email: str
+
+class StartLoginResponse(BaseModel):
+    challenge: str
+    rpId: str
+    allowCredentials: Optional[list] = None
+
+class FinishLoginRequest(BaseModel):
+    email: str
+    id: str
+    rawId: str
+    response: Dict[str, Any]
+    type: str
+
+
+def _issue_challenge(email: str, kind: str = "registration") -> dict:
+    if db is None:
+        raise HTTPException(status_code=500, detail="Database not configured")
+    challenge = os.urandom(32)
+    now = datetime.now(timezone.utc)
+    expires_at = now + timedelta(minutes=WEBAUTHN_TTL_MINUTES)
+    doc = {
+        "email": email,
+        "kind": kind,
+        "challenge": _b64url(challenge),
+        "created_at": now,
+        "updated_at": now,
+        "expires_at": expires_at,
+        "used": False,
+    }
+    db["authchallenge"].insert_one(doc)
+    return doc
+
+
+def _get_rp_id(request: Request) -> str:
+    host = request.headers.get("host", "localhost")
+    # strip port
+    return host.split(":")[0]
+
+
+@app.post("/webauthn/register/start", response_model=StartRegResponse)
+async def webauthn_register_start(req: Request, payload: StartRegRequest):
+    if db is None:
+        raise HTTPException(status_code=500, detail="Database not configured")
+    ch = _issue_challenge(payload.email, "registration")
+    rp_id = _get_rp_id(req)
+    user_id = _b64url(payload.email.encode("utf-8"))
+    return StartRegResponse(challenge=ch["challenge"], rpId=rp_id, userId=user_id)
+
+
+@app.post("/webauthn/register/finish")
+async def webauthn_register_finish(payload: FinishRegRequest):
+    if db is None:
+        raise HTTPException(status_code=500, detail="Database not configured")
+    # Lookup latest registration challenge
+    ch = db["authchallenge"].find_one({"email": payload.email, "kind": "registration", "used": False}, sort=[("created_at", -1)])
+    if not ch:
+        raise HTTPException(status_code=400, detail="No active challenge")
+    now = datetime.now(timezone.utc)
+    if now > ch.get("expires_at", now):
+        raise HTTPException(status_code=400, detail="Challenge expired")
+
+    # Upsert user and store credential id (no full verification in demo)
+    users = db["authuser"]
+    user = users.find_one({"email": payload.email})
+    cred = {
+        "cred_id": payload.id,
+        "created_at": now,
+        "sign_count": 0,
+    }
+    if user:
+        users.update_one({"_id": user["_id"]}, {"$set": {"name": payload.name or user.get("name")}, "$addToSet": {"credentials": cred}})
+    else:
+        users.insert_one({
+            "email": payload.email,
+            "name": payload.name,
+            "credentials": [cred],
+            "is_active": True,
+            "created_at": now,
+            "updated_at": now,
+        })
+
+    db["authchallenge"].update_one({"_id": ch["_id"]}, {"$set": {"used": True, "updated_at": now}})
+    return {"ok": True}
+
+
+@app.post("/webauthn/login/start", response_model=StartLoginResponse)
+async def webauthn_login_start(req: Request, payload: StartLoginRequest):
+    if db is None:
+        raise HTTPException(status_code=500, detail="Database not configured")
+    user = db["authuser"].find_one({"email": payload.email})
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    ch = _issue_challenge(payload.email, "login")
+    rp_id = _get_rp_id(req)
+    allow = [{"type": "public-key", "id": c.get("cred_id")} for c in user.get("credentials", [])]
+    return StartLoginResponse(challenge=ch["challenge"], rpId=rp_id, allowCredentials=allow)
+
+
+@app.post("/webauthn/login/finish")
+async def webauthn_login_finish(payload: FinishLoginRequest):
+    if db is None:
+        raise HTTPException(status_code=500, detail="Database not configured")
+    ch = db["authchallenge"].find_one({"email": payload.email, "kind": "login", "used": False}, sort=[("created_at", -1)])
+    if not ch:
+        raise HTTPException(status_code=400, detail="No active challenge")
+    now = datetime.now(timezone.utc)
+    if now > ch.get("expires_at", now):
+        raise HTTPException(status_code=400, detail="Challenge expired")
+
+    # Check that credential id is known
+    user = db["authuser"].find_one({"email": payload.email, "credentials.cred_id": payload.id})
+    if not user:
+        raise HTTPException(status_code=400, detail="Unknown credential")
+
+    # Mark used
+    db["authchallenge"].update_one({"_id": ch["_id"]}, {"$set": {"used": True, "updated_at": now}})
+    # Issue a simple session token (demo)
+    session_token = _random_token(32)
+    db["authsession"].insert_one({
+        "token": session_token,
+        "status": "consumed",
+        "kind": "login",
+        "email": payload.email,
+        "created_at": now,
+        "updated_at": now,
+        "expires_at": now + timedelta(hours=12),
+    })
+    return {"ok": True, "session": session_token}
 
 
 if __name__ == "__main__":
